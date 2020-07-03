@@ -233,14 +233,11 @@ class Sim800(object):
         time.sleep(0.25)
         GPIO.output(self.__resetPin, GPIO.HIGH)
 
-    def __restartPowerSupply(self):
+    def __resetPowerSupply(self):
         if self.__psDisablePin is not None:
             GPIO.output(self.__psDisablePin, GPIO.HIGH)
             time.sleep(0.25)
             GPIO.output(self.__psDisablePin, GPIO.LOW)
-
-    def __restartPowerSupply(self):
-
     
     def __ping(self, timeout=None):
         self.__write('AT')
