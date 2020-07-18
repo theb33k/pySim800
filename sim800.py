@@ -5,51 +5,70 @@ from __future__ import print_function
 from builtins import input
 
 import logging
-logger = logging.getLogger(__name__)
 import serial
 import time
 import re
 import os
-
 import RPi.GPIO as GPIO
 
+logger = logging.getLogger("app.sim800")
+GPIO.setwarnings(False)
+
 class Sim800(object):
-    def __init__(self, device, resetPin=17, powerSupplyDisablePin=None):
+    GET=0
+    POST=1
+    HEAD=2
+    def __init__(self, device, resetPin=27, powerSupplyResetPin=22):
         self.__device = device
         self.__serial = None
         self.__serialBaudrate = 9600
         self.__availableSms = []
-        self.__connected = False
+        self.__serialReady = False
+        self.__gsmReady = False
         self.__gprsReady = False
         self.__gprsBearerId = None
-        self.__ipAddress = None
+        self.__ipAddress = "0.0.0.0"
         # setup reset pin
         self.__resetPin = resetPin
         GPIO.setmode(GPIO.BCM)  
         GPIO.setup(self.__resetPin, GPIO.OUT, pull_up_down=GPIO.PUD_OFF)
         GPIO.output(self.__resetPin, GPIO.HIGH) # reset is active LOW
-        # setup powerSuply pin
-        self.__psDisablePin = powerSupplyDisablePin
-        if self.__psDisablePin is not None:
-            GPIO.setup(self.__psDisablePin, GPIO.OUT, pull_up_down=GPIO.PUD_OFF)
-            GPIO.output(self.__psDisablePin, GPIO.LOW) # PS is OFF when pin is HIGH
+        # setup powerSupply pin
+        self.__powerSupplyResetPin = powerSupplyResetPin
+        if self.__powerSupplyResetPin is not None:
+            GPIO.setup(self.__powerSupplyResetPin, GPIO.OUT, pull_up_down=GPIO.PUD_OFF)
+            GPIO.output(self.__powerSupplyResetPin, GPIO.LOW) # PS is OFF when pin is HIGH
     
-    def begin(self, device=None, baudrate=None, timeout=1.5):
-        if not self.__connected:
+    def begin(self, device=None, baudrate=None, timeout=2):
+        """ Open serial and start init procedure for Sim800L module:
+        This method MUST be called before any other
+        1. reboot device (restart power supply)
+        2. reset All params to default configuration
+        3. Check Ping
+            if KO: Enter recovery mode, ie. restart step 1. and 2.
+        4. Configure GSM
+        """
+        if not self.__serialReady:
             if device:
                 self.__device = device
-            if baudrate is not None:
+            if baudrate:
                 self.__serialBaudrate = baudrate
             self.__serial = serial.Serial(self.__device, baudrate=self.__serialBaudrate, timeout=timeout)
-            # self.__serial.write(b'\x1B') # ESC
             self.__serial.reset_input_buffer()
+            self.__serialReady = True
+        
+        self.__resetPowerSupply() # Reset will re-enable unsollicited codes
+        time.sleep(5)
+        
+        if not self.__gsmReady:
             if not self.__ping():
-                # reset with GPIO then wait for 10 seconds ?
                 if not self.__recovery():
                     self.__serial.close()
                     return False
+            else:
+                self.__resetDefaultConfig() # reset all params to default
             if self.__setupGSM():
-                self.__connected = True
+                self.__gsmReady = True
                 return True
         else:
             if timeout and timeout != self.__serial.timeout:
@@ -59,15 +78,21 @@ class Sim800(object):
         return False
 
     def stop(self):
-        if self.__connected:
+        self.__httpEnd()
+        if self.__gprsReady:
+            self.__attachGPRS(detach=True)
+            self.__gprsReady = False
+        if self.__gsmReady:
+            self.__setPhoneFunctionnalityState(False)
+            self.__gsmReady = False
+        self.__ipAddress = "0.0.0.0"
+        if self.__serialReady:
             self.__serial.close()
-            self.__connected = False
-        else:
-            logger.error("Trying to call stop() while sim800 is not connected")
-            return False
+            self.__serialReady = False
+        return True
 
     def available(self):
-        if self.__connected:
+        if self.__gsmReady:
             self.__checkNewSms()
             return len(self.__availableSms)
         else:
@@ -76,7 +101,7 @@ class Sim800(object):
 
     def readSms(self): 
         """reads the oldest unread sms and delete it from sim800 module"""
-        if self.__connected:
+        if self.__gsmReady:
             if self.available() > 0:
                 i = self.__availableSms[0]
                 del self.__availableSms[0]
@@ -106,7 +131,7 @@ class Sim800(object):
     
     def sendSms(self, number, text):
         """send sms and delete it from sim800 module"""
-        if self.__connected:
+        if self.__gsmReady:
             logger.debug("Send SMS to %s", number)
             if self.__setTextMode():
                 self.__write('AT+CMGS="%s"' % number)
@@ -131,96 +156,113 @@ class Sim800(object):
             return False
 
     def flush(self):
-        if self.__connected:
+        if self.__gsmReady:
             return self.__deleteSms("ALL")
         else:
             logger.error("Trying to call flush() while sim800 is not connected")
             return False
 
     def isOpen(self):
-        return self.__connected == True
+        return self.__gsmReady == True    
 
-    def setupGPRS(self, apn="free"):
-        if not self.__connected:
-            logger.error("Trying to call setupGPRS() while sim800 is not connected")
-            return False
-        if not self.__gprsReady:
-            if not self.__attachGPRS():
-                logger.error("Unable to attach GPRS")
-                return False
-            if not self.__activateBearerProfile(bearerId=1):
-                logger.error("Unable to activate bearer profile")
-                return False
-            if not self.__setBearerAPN(apn=apn):
-                logger.error("Unable to setup APN")
-                return False
-            if not self.__openBearer():
-                logger.error("Unable to open Bearer")
-                return False
-            self.__gprsReady = True
-        return True
-    
-    
-
-    def httpGet(self, url=""):
-        if not self.__connected:
+    def httpGet(self, url):
+        """ Send GET request to url
+        returns a tuple: (HTTP status, data)
+        """
+        if not self.__gsmReady:
             logger.error("Trying to call httpGet() while sim800 is not connected")
-            return False
+            return (0,0)
         if not self.__gprsReady:
-            logger.error("Trying to use HTTP while GPRS is not configured")
-            return False
+            res = self.__setupGPRS()
+            if not res:
+                logger.error("Trying to use HTTP while GPRS is not configured")
+                return (0,0)
         if not self.__httpInit():
             logger.error("HTTP: init failed")
-            return False
+            return (0,0)
         if not self.__httpBindBearer():
             logger.error("HTTP: Unable to bind bearer")
-            return False
+            return (0,0)
         if not self.__httpSetUrl(url=url):
             logger.error("HTTP: Unable to setup URL")
-            return False
-        status = self.__httpSendGetRequest()
+            return (0,0)
+        status, dataLength = self.__httpSendRequest(self.GET)
         data = []
         if not status:
             logger.error("HTTP: Unable send GET request")
-            return False
-        elif status["httpStatusCode"] != 200:
-            logger.warning("HTTP: GET request returned %d" % status["httpStatusCode"])
+            return (0,0)
+        elif status != 200:
+            logger.warning("HTTP: GET request returned %d" % status)
         else:
-            response = self.__httpGetData()
-            if response is False:
+            ok, data = self.__httpReadData()
+            if not ok:
                 logger.error("HTTP: Failed to read GET response")
-                return False
-            else:
-                data = response
-        ended = self.__httpEnd()
-        return {"status":status["httpStatusCode"], "data": data, "httpEnded": ended}
+                return (0,0)
+        self.__httpEnd()
+        return (status, data)
 
     # FIXME
-    def httpPost(self, url="", dataDict={}):
-        if not self.__connected:
+    # Wait
+    def httpPost(self, url, data, contentType="text/plain"):
+        if not self.__gsmReady:
             logger.error("Trying to call httpPost() while sim800 is not connected")
-            return False
+            return (0,0)
         if not self.__gprsReady:
-            logger.error("Trying to use HTTP while GPRS is not configured")
-            return False
+            res = self.__setupGPRS()
+            if not res:
+                logger.error("Trying to use HTTP while GPRS is not configured")
+                return (0,0)
+        if not self.__httpInit():
+            logger.error("HTTP: init failed")
+            return (0,0)
+        if not self.__httpBindBearer():
+            logger.error("HTTP: Unable to bind bearer")
+            return (0,0)
+        if not self.__httpSetUrl(url=url):
+            logger.error("HTTP: Unable to setup URL")
+            return (0,0)
+        if not self.__httpSetPostData(data, contentType=contentType):
+            logger.error("HTTP: Unable to write post data")
+            return (0,0)
 
+        status, dataLength = self.__httpSendRequest(self.POST)
+        ok, data = self.__httpReadData() # debug
+        data = []
+        if not status:
+            logger.error("HTTP: Unable send POST request")
+            return (0,0)
+        elif status != 200:
+            logger.warning("HTTP: POST request returned %d" % status)
+        else:
+            ok, data = self.__httpReadData()
+            if not ok:
+                logger.error("HTTP: Failed to read POST response")
+                return (0,0)
+        self.__httpEnd()
+        return (status, data)
 
 ##################################################################
 #                         Private methods                        #
 ##################################################################
 
     def __recovery(self):
+        logger.info("Recovering from error")
         if not self.__ping():
-            logger.error("Module ping failed. Reset configuration")
+            logger.warning("Module ping failed.")
             self.__write("\x1b", end="")
             if not self.__resetDefaultConfig():
-                logger.fatal("Unable to reset configuration.")
-                self.__hardwareReset():
+                self.__hardwareReset()
                 time.sleep(5)
             if not self.__ping():
-                logger.fatal("Module ping failed after reset. Abort")
-                self.__serial.close()
-                return False
+                logger.warning("Module ping failed.")
+                self.__resetPowerSupply()
+                time.sleep(10)
+                if not self.__ping():
+                    logger.warning("Module ping failed.")
+                    logger.fatal("Still no ping after restart. Abort.")
+                    self.__serial.close()
+                    return False
+        logger.info("Successfully recovered")
         return True
 
     def __resetDefaultConfig(self):
@@ -229,19 +271,29 @@ class Sim800(object):
         return self.__checkStatus()
 
     def __hardwareReset(self):
+        logger.warning("Module hardware reset")
         GPIO.output(self.__resetPin, GPIO.LOW)
         time.sleep(0.25)
         GPIO.output(self.__resetPin, GPIO.HIGH)
 
     def __resetPowerSupply(self):
-        if self.__psDisablePin is not None:
-            GPIO.output(self.__psDisablePin, GPIO.HIGH)
+        logger.warning("Restart Module power supply")
+        if self.__powerSupplyResetPin is not None:
+            GPIO.output(self.__powerSupplyResetPin, GPIO.HIGH)
             time.sleep(0.25)
-            GPIO.output(self.__psDisablePin, GPIO.LOW)
-    
+            GPIO.output(self.__powerSupplyResetPin, GPIO.LOW)
+            return True
+        else:
+            return False
+
     def __ping(self, timeout=None):
         self.__write('AT')
-        return self.__checkStatus()
+        ret = self.__checkStatus()
+        if ret:
+            self.__serialReady = True
+        else:
+            self.__serialReady = False
+        return ret
 
 ##################################################################
 #                            GSM methods                         #
@@ -257,11 +309,16 @@ class Sim800(object):
                 self.__availableSms.append(index)
 
     def __setupGSM(self):
-        logger.info("Setup sim800 module")
+        logger.info("Setup GSM")
 
-        if not self.__disableURCPresentation():
+        if not self.__disableURCPresentation(): # Disable Call Ready message
             logger.error("Unable to disable URC presentation")
             return False
+
+        if not self.__setPhoneFunctionnalityState(True):
+            logger.error("Unable to set phone functionality")
+            return False
+        self.__waitFor("SMS Ready", timeout=10)
 
         if not self.__setTextMode():
             logger.error("Unable to set text mode")
@@ -272,11 +329,7 @@ class Sim800(object):
             logger.error("Unable to set GSM mode")
             return False
 
-        if not self.__setPhoneFunctionnalityState(True):
-            logger.error("Unable to set phone functionality")
-            return False
-
-        if not self.__enableNewMessageIndication():
+        if not self.__enableNewMessageIndication(): # Enable SMS Ready message
             logger.error("Unable to enable new message indication")
             return False
 
@@ -292,14 +345,19 @@ class Sim800(object):
             return False
         else:
             self.__availableSms = unread
+            logger.info("%d Unread SMS" % len(unread))
         logger.debug("Sim800 setup success")
         return True
 
     def __fetchSms(self, status):
-        """fetch all unread sms without changing their state"""
-        if status not in ["READ", "UNREAD", "SENT", "UNSENT", "ALL"]:
-            logger.error("__fetchSms(): invalid argument: " + str(status))
-            return False
+        """Fetch all unread sms without changing their state
+        Param status:
+            READ
+            UNREAD
+            SENT"
+            UNSENT
+            ALL
+        """
         if "READ" in status:
             status = "REC " + status
         elif "SENT" in status:
@@ -330,7 +388,21 @@ class Sim800(object):
     def __setTextMode(self):
         self.__write('AT+CMGF=1')
         return self.__checkStatus()
-
+    
+    def __getTextMode(self):
+        self.__write("AT+CMGF?")
+        r = self.__waitFor(r"CMGF: [01]", regex=True)
+        textMode = None
+        if r:
+            if r[0] == "0":
+                textMode = "pdu"
+            else:
+                textMode = "text"
+        else:
+            logger.error("Unable to read text mode")
+        status = self.__rcheckStatus()
+        return textMode
+        
     def __setGSMMode(self):
         self.__write('AT+CSCS="GSM"')
         return self.__checkStatus(5)
@@ -349,9 +421,16 @@ class Sim800(object):
         return self.__checkStatus()
 
     def __deleteSms(self, status):
-        if status not in ["READ", "UNREAD", "SENT", "UNSENT", "INBOX", "ALL"]:
-            logger.error("__deletSms(): invalid argument: " + str(status))
-            return False
+        """Delete SMS with status:
+        Param:
+            READ
+            UNREAD
+            SENT
+            UNSENT
+            INBOX
+            ALL
+        """
+    
         self.__write('AT+CMGDA="DEL %s"' % status)
         return self.__checkStatus()
 
@@ -367,6 +446,35 @@ class Sim800(object):
 #                           GPRS methods                         #
 ##################################################################
 
+    def __setupGPRS(self, apn="free"):
+        if not self.__gsmReady:
+            logger.error("Trying to call setupGPRS() while sim800 is not connected")
+            return False
+        if not self.__gprsReady:
+            if not self.__attachGPRS():
+                logger.error("Unable to attach GPRS")
+                return False
+            if not self.__activateBearerProfile(bearerId=1):
+                logger.error("Unable to activate bearer profile")
+                return False
+            if not self.__setBearerAPN(apn=apn):
+                logger.error("Unable to setup APN")
+                return False
+            cmdStatus, bearerId, bearerStatus, ipAddress = self.__getBearerSatus()
+            if cmdStatus and bearerStatus != 1: # Not connected yet
+                if not self.__openBearer():
+                    logger.error("Unable to open Bearer")
+                    return False
+                time.sleep(1)
+                # wait for connection (ie. bearerStatus = 1)
+                start = time.time()
+                while bearerStatus != 1 and time.time() - start < 10:
+                    cmdStatus, bearerId, bearerStatus, ipAddress = self.__getBearerSatus()
+                    time.sleep(2)
+            self.__ipAddress = ipAddress
+            self.__gprsReady = True
+        return True
+
     def __attachGPRS(self, detach=False):
         self.__write('AT+CGATT=%d' % (0 if detach else 1))
         return self.__checkStatus()
@@ -380,26 +488,40 @@ class Sim800(object):
         self.__write('AT+SAPBR=3,%d,"APN","%s"' % (self.__gprsBearerId, apn))
         return self.__checkStatus()
 
-    def __checkBearer(self):
+    def __getBearerSatus(self):
+        """ Get Brearer current status
+        Returns a tuple with:
+        0: The AT command status: True or False (following fields are invalid)
+        1: the bearer id
+        2: The bearer status:
+            0: connecting
+            1: connected
+            2: closing:
+            3: closed
+        3: the ip address
+        """
         self.__write('AT+SAPBR=2,%d' % self.__gprsBearerId)
-        line = self.__readline() # echo
-        line = self.__readline() # answer
-        m = re.search(r'\+SAPBR: [0-9]+,([0-9]+),(.*)', line)
-        status = None
-        if m:
-            g = m.groups()
-            status = g[0]
-            self.__ipAddress = g[1]
-        atStatus = self.__checkStatus()
-        if atStatus and status == "1":
-            return True
-        return False
+        r = self.__waitFor(r'\+SAPBR: ([0-9]+),([0-9]+),(.*)', regex=True)
+        bearerStatus = None
+        if r:
+            bearerId = int(r[0])
+            bearerStatus = int(r[1])
+            ipAddress = r[2]
+        else:
+            bearerId = None
+            bearerStatus = None
+            ipAddress = "0.0.0.0"
+        # logger.debug("Enable bearer: status: %s, IP:%s" % (bearerStatus, self.__ipAddress))
+        # logger.debug("Test readIpAddress")
+        # self.__readIPAddress()
+        # time.sleep(5)
+        # self.__readIPAddress()
+
+        return (self.__checkStatus(), bearerId, bearerStatus, ipAddress)
 
     def __openBearer(self):
-        if self.__checkBearer():
-            return True
         self.__write('AT+SAPBR=1,%d' % self.__gprsBearerId)
-        return self.__checkStatus()
+        return self.__checkStatus(timeout=5)
 
     # To get local IP address
 
@@ -411,14 +533,17 @@ class Sim800(object):
         self.__write('AT+CIICR')
         return self.__checkStatus()
 
-    def __getIPAddress(self):
-        self.__write('AT+CIFSR')
-        echo = self.__readline()
-        response = self.__readline()
-        if "ERROR"in response:
-            return False
-        else:
-            return response
+    # FIXME: Use __waitFor method
+    def getIPAddress(self):
+        return self.__ipAddress
+        # self.__write('AT+CIFSR')
+        # echo = self.__readline()
+        # response = self.__readline()
+        # if "ERROR"in response:
+        #     return False
+        # else:
+        #     self.__ipAddress = response
+        #     return True
 
 ##################################################################
 #                           HTTP methods                         #
@@ -438,38 +563,53 @@ class Sim800(object):
         self.__write('AT+HTTPPARA="CID",%d' % self.__gprsBearerId)
         return self.__checkStatus()
 
-    def __httpSetUrl(self, url=""):
-        if url:
-            self.__write('AT+HTTPPARA="URL","%s"' % url)
-            return self.__checkStatus()
-        return False
+    def __httpSetUrl(self, url):
+        self.__write('AT+HTTPPARA="URL","%s"' % url)
+        return self.__checkStatus()
+    
+    def __httpSetContentType(self, contentType):
+        """Set HTTP MIME type:
+        Param mime:
+            * application/json
+            * application/octet-stream
+            * text/plain
+            * ... cf HTTP standard
+        """
+        self.__write('AT+HTTPPARA="CONTENT","%s"' % contentType)
+        return self.__checkStatus()
 
-    def __setPostData(self, data):
-        binaryData = bytearray(data, "utf-8")
-        dataLen = len(binaryData)
-        if datalen > 319488:
-            logger.error("HTTP: Too many POST data to transmit at once")
+    def __httpSetPostData(self, data, contentType=None):
+        if isinstance(data, str) or isinstance(data, unicode):
+            serialData = bytearray(data, "utf-8")
+            if not contentType:
+                contentType = "text/plain"
+        else:
+            serialData = bytearray(data)
+            if not contentType:
+                contentType = "application/octet-stream"
+
+        if not self.__httpSetContentType(contentType):
+            logger.error("Unable to set HTTP Content-type")
             return False
-        elif dataLen <= 0:
-            logger.error("HTTP invalid POST data size")
+
+        dataLen = len(serialData)
+        if dataLen ==0 or dataLen > 319488:
+            logger.error("HTTP: POST data must be between 1 and 319488 bytes")
             return False
-        dataTransmitTime =  int(1.2 * float(dataLen + 2) * 8.0 / (self.__serialBaudrate * 8.0 / 10.0))
-        if dataTransmitTime > 120:
+
+        bitsToTransmit = float(dataLen + 2) * 8.0
+        averageBitRate = float(self.__serialBaudrate) * 8.0 / 10.0 #  8data bits + 1 start + 1 stop
+        dataTransmitTime = 1000 + 1000.0 * bitsToTransmit / averageBitRate
+        if dataTransmitTime > 120000:
             logger.error("HTTP: Transmit POSTS data to module will take too long. Reduce data size or increase baudrate")
             return False
+        # dataTransmitTime = 10000
         self.__write('AT+HTTPDATA=%d,%d' % (dataLen, dataTransmitTime))
-        resp = self.__readline()
-        if "DOWNLOAD" in resp:
-            self.__serial.write(binaryData + "\r\n")
-
-    def __httpSendGetRequest(self):
-        return self.__httpSendRequest(0)
-
-    def __httpSendPostRequest(self):
-        return self.__httpSendRequest(1)
-
-    def __httpSendHeadRequest(self):
-        return self.__httpSendRequest(2)
+        if self.__waitFor("DOWNLOAD"):
+            self.__serial.write(serialData)
+            time.sleep(dataTransmitTime/1000.0)
+            return True
+        return False
 
     def __httpSendRequest(self, requestType=0):
         """ Param requestType:
@@ -479,32 +619,25 @@ class Sim800(object):
         """
         self.__write('AT+HTTPACTION=%d' % requestType)
         if self.__checkStatus():
-            response = self.__readline(10)
-            m = re.search(r"HTTPACTION: ?([012]),([0-9]+),([0-9]*)", response)
-            if m:
-                g = m.groups()
-                return {"requestType": int(g[0]),
-                        "httpStatusCode": int(g[1]),
-                        "dataLength": int(g[2])}
-        return False
+            r = self.__waitFor(r"\+HTTPACTION: ?[012],([0-9]+),([0-9]*)", timeout=20, regex=True)
+            if r:
+                return (int(r[0]), int(r[1])) # (status, data length)
+        return (0, 0)
 
-    def __httpGetData(self):
+    def __httpReadData(self):
         self.__write('AT+HTTPREAD')
-        echo = self.__readline()
-        header = self.__readline()
-        m = re.search(r"HTTPREAD: ([0-9]+)", header)
-        data, dataLen = None, -1
-        if m:
-            dataLen = int(m.groups()[0])
-            data = self.__readline()
-        status = self.__checkStatus()
-        return {"dataLen": dataLen,
-                "data": data,
-                "atStatus": status}
+        r = self.__waitFor(r"HTTPREAD: ([0-9]+)", regex=True)
+        if r:
+            length = int(r[0])
+            data = bytearray(self.__serial.read(length))
+
+        return (self.__checkStatus(), data)
 
     def __httpEnd(self):
         self.__write('AT+HTTPTERM')
         return self.__checkStatus()
+
+    
 
     
     
@@ -513,8 +646,8 @@ class Sim800(object):
 ##################################################################
 
     def __write(self, s, end="\r"):
-        logger.debug(b"WRITE:" + bytearray(s+end, "ascii"))
-        self.__serial.write(bytearray(s+end, "ascii"))
+        logger.debug(b"WRITE:" + bytearray(s+end, "utf-8"))
+        self.__serial.write(bytearray(s+end, "utf-8"))
 
     def __readline(self, timeout=None):
         if timeout:
@@ -537,16 +670,38 @@ class Sim800(object):
             return line[:-2].decode(errors="ignore")
         return line.decode(errors="ignore")
 
-    def __checkStatus(self, timeout=None):
-        line = 1
-        while line:
-            line = self.__readline(timeout=timeout)
-            if "OK" in line:
-                return True
-            elif "ERROR" in line:
-                return False
-        return False
+    def __waitFor(self, responses, timeout=None, regex=False):
+        """Wait for a specific module answer
+        Params:
+            * response: a string or a list of strings
+            * timeout: maximum time to wait for the response
+        Returns: the matching response, or None
+        Info:
+            * This methos will throw away everithing send by the module until match or timeout
+            * Remove all \r\n
+        """
+        if not isinstance(responses, list):
+            responses = [responses]
+        if not timeout:
+            timeout = self.__serial.timeout
+        start = time.time()
+        ret = None
+        while not ret and time.time()-start < timeout:
+            resp = self.__readline()
+            for expected in responses:
+                if regex:
+                    m = re.search(expected, resp)
+                    if m:
+                        return m.groups()
+                else:
+                    if resp == expected:
+                        return resp
+        return None
 
+    def __checkStatus(self, timeout=None):
+        if self.__waitFor(["OK", "ERROR"], timeout=timeout) == "OK":
+            return True
+        return False
 
 
 ##################################################################
