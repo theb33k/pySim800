@@ -167,7 +167,9 @@ class Sim800(object):
 
     def httpGet(self, url):
         """ Send GET request to url
-        returns a tuple: (HTTP status, data)
+        returns (status, data):
+            status: HTTP error code
+            data: Either None or a bytearray
         """
         if not self.__gsmReady:
             logger.error("Trying to call httpGet() while sim800 is not connected")
@@ -201,9 +203,12 @@ class Sim800(object):
         self.__httpEnd()
         return (status, data)
 
-    # FIXME
-    # Wait
     def httpPost(self, url, data, contentType="text/plain"):
+        """ Send POST request to url
+        returns (status, data):
+            status: HTTP error code
+            data: Either None or a bytearray
+        """
         if not self.__gsmReady:
             logger.error("Trying to call httpPost() while sim800 is not connected")
             return (0,0)
