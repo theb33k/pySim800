@@ -11,7 +11,7 @@ import re
 import os
 import RPi.GPIO as GPIO
 
-logger = logging.getLogger("app.sim800")
+logger = logging.getLogger("sim800")
 GPIO.setwarnings(False)
 
 class Sim800(object):
